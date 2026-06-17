@@ -21,7 +21,12 @@ struct ClickPoint: Identifiable, Equatable {
 final class ClickEngine: ObservableObject {
 
     /// Targets the user marked with a right-click.
-    @Published private(set) var points: [ClickPoint] = []
+    @Published private(set) var points: [ClickPoint] = [] {
+        didSet { syncOverlays() }
+    }
+
+    /// On-screen marker windows, keyed by point id.
+    private var overlays: [UUID: OverlayWindow] = [:]
     /// Whether the tap is live (right-click records, left-click fires).
     @Published private(set) var isArmed = false
     /// Cached accessibility-permission state for the UI.
@@ -182,28 +187,65 @@ final class ClickEngine: ObservableObject {
         }
     }
 
-    /// True if the cursor is currently over one of our visible windows.
+    /// True if the cursor is over our main app window (overlays excluded — they
+    /// sit exactly on the click targets and must stay transparent to clicks).
     private func isPointInsideOwnWindow() -> Bool {
         let mouse = NSEvent.mouseLocation // bottom-left global coords
-        return NSApp.windows.contains { $0.isVisible && $0.frame.contains(mouse) }
+        return NSApp.windows.contains {
+            $0.isVisible && !($0 is OverlayWindow) && $0.frame.contains(mouse)
+        }
     }
 
-    /// Replays a left click at every recorded point, then restores the cursor.
+    // MARK: - Marker overlays
+
+    /// Keeps the on-screen markers in sync with `points`.
+    private func syncOverlays() {
+        let liveIDs = Set(points.map(\.id))
+
+        // Drop markers whose point is gone.
+        for (id, window) in overlays where !liveIDs.contains(id) {
+            window.orderOut(nil)
+            overlays[id] = nil
+        }
+
+        // Add markers for new points.
+        for point in points where overlays[point.id] == nil {
+            let window = OverlayWindow(point: point)
+            overlays[point.id] = window
+            window.orderFrontRegardless()
+        }
+    }
+
+    /// Replays a full left click at every recorded point, back to back, then
+    /// restores the cursor.
+    ///
+    /// macOS exposes a single cursor *and* a single left-button state, so a
+    /// click only registers as a complete down→up cycle. Two points cannot be
+    /// "held" at once (the OS already thinks the button is down), which is why
+    /// truly simultaneous / multi-touch clicking is impossible. Instead each
+    /// point gets its own complete click in sequence — but the whole sweep
+    /// finishes in well under a millisecond, so it reads as instantaneous.
     private func fireClicks(restoringCursorTo origin: CGPoint) {
         guard !points.isEmpty else { return }
-        let source = CGEventSource(stateID: .hidSystemState)
-        for point in points {
-            for mouseType in [CGEventType.leftMouseDown, .leftMouseUp] {
-                guard let event = CGEvent(
-                    mouseEventSource: source,
-                    mouseType: mouseType,
-                    mouseCursorPosition: point.location,
-                    mouseButton: .left
-                ) else { continue }
-                event.setIntegerValueField(.eventSourceUserData, value: Self.syntheticTag)
-                event.post(tap: .cghidEventTap)
-            }
+
+        func post(_ type: CGEventType, at point: CGPoint) {
+            // A fresh source per event avoids WindowServer coalescing rapid
+            // clicks into a single multi-click.
+            guard let event = CGEvent(
+                mouseEventSource: CGEventSource(stateID: .hidSystemState),
+                mouseType: type,
+                mouseCursorPosition: point,
+                mouseButton: .left
+            ) else { return }
+            event.setIntegerValueField(.eventSourceUserData, value: Self.syntheticTag)
+            event.post(tap: .cghidEventTap)
         }
+
+        for p in points {
+            post(.leftMouseDown, at: p.location)
+            post(.leftMouseUp, at: p.location)
+        }
+
         CGWarpMouseCursorPosition(origin)
     }
 }
